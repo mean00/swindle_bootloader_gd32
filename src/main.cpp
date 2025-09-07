@@ -28,7 +28,7 @@
 #include "reboot.h"
 #include "usb.h"
 #include "watchdog.h"
-#include "xxhash.h"
+// #include "xxhash.h"
 #include <string.h>
 
 #include "lnCpuID.h"
@@ -42,10 +42,15 @@ void lnExtiSWDOnly();
 extern "C" uint32_t ch32_crc(uint32_t addr, uint32_t len_in_u32);
 
 uint32_t go_dfu = 0;
+#define FLASH_START_ADDR 0x08000000UL
 
 int main(void)
 {
-    const uint32_t start_addr = 0x08000000 + (FLASH_BOOTLDR_SIZE_KB * 1024);
+    {
+        volatile uint32_t *_csb_vtor = (uint32_t *)0xE000ED08U;
+        *_csb_vtor = FLASH_START_ADDR;
+    }
+    const uint32_t start_addr = FLASH_START_ADDR + (FLASH_BOOTLDR_SIZE_KB * 1024);
     const uint32_t *const base_addr = (uint32_t *)start_addr;
 
     uint32_t sig = base_addr[0];

@@ -14,7 +14,7 @@
 #define CMD_ERASE 0x41
 
 // Payload/app comes inmediately after Bootloader
-#define APP_ADDRESS (FLASH_BASE_ADDR + (FLASH_BOOTLDR_SIZE_KB)*1024)
+#define APP_ADDRESS (FLASH_BASE_ADDR + (FLASH_BOOTLDR_SIZE_KB) * 1024)
 
 extern void lcdRun();
 
@@ -494,6 +494,7 @@ extern volatile uint32_t sysTick;
 #define LED PC13
 #endif
 #define LED2 PA8
+#define LED3 PB13
 volatile int nextTick = 0;
 void runDfu()
 {
@@ -517,6 +518,7 @@ void runDfu()
 
     lnPinMode(LED, lnOUTPUT);
     lnPinMode(LED2, lnOUTPUT);
+    lnPinMode(LED3, lnOUTPUT);
     bool led = false;
     nextTick = sysTick + 100;
     while (1)
@@ -533,6 +535,7 @@ void runDfu()
             nextTick += 100;
             lnDigitalWrite(LED, led);
             lnDigitalWrite(LED2, led);
+            lnDigitalWrite(LED3, led);
             led = !led;
         }
     }
