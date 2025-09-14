@@ -77,7 +77,7 @@ add_library(miniLnArduino STATIC lnArduino_mini/systemHelper.cpp
     lnArduino_mini/lnIRQ_arm_gd32fx.cpp)
 
 
-GENERATE_GD32_FIRMWARE(lnBMP_bootloader
+GENERATE_GD32_FIRMWARE(swindle_gd_bootloader
                 src/main.cpp
                 src/usb.cpp
                 # src/xxhash.c
@@ -90,11 +90,11 @@ GENERATE_GD32_FIRMWARE(lnBMP_bootloader
                 )
 
 
-target_link_libraries(lnBMP_bootloader  miniLnArduino)
+target_link_libraries(swindle_gd_bootloader  miniLnArduino)
 #
 #SET(SCRIPT ${LN_CUSTOM_LD_SCRIPT} CACHE INTERNAL "")
 
-#TARGET_LINK_OPTIONS(lnBMP_bootloader PRIVATE "-T${SCRIPT}")
+#TARGET_LINK_OPTIONS(swindle_gd_bootloader PRIVATE "-T${SCRIPT}")
 
 #
 #
@@ -106,11 +106,11 @@ IF(USE_GD32_CRYSTALLESS)
   set(EXTRA_NAME "_nocrystal")
 ENDIF()
 
-set_target_properties(lnBMP_bootloader PROPERTIES OUTPUT_NAME lnBMP_bootloader_arm${EXTRA_NAME})
+set_target_properties(swindle_gd_bootloader PROPERTIES OUTPUT_NAME swindle_gd_bootloader_arm${EXTRA_NAME})
 
 #IF(USE_GD32F3)
-#set_target_properties(lnBMP_bootloader PROPERTIES OUTPUT_NAME lnBMP_bootloader_GD32F303)
+#set_target_properties(swindle_gd_bootloader PROPERTIES OUTPUT_NAME swindle_gd_bootloader_GD32F303)
 #ELSE(USE_GD32F3)
-#set_target_properties(lnBMP_bootloader PROPERTIES OUTPUT_NAME lnBMP_bootloader_STM32F103)
+#set_target_properties(swindle_gd_bootloader PROPERTIES OUTPUT_NAME swindle_gd_bootloader_STM32F103)
 #ENDIF(USE_GD32F3)
 
