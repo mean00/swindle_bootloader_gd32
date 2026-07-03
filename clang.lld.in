@@ -37,10 +37,10 @@ PROVIDE(eeprom_begin = ORIGIN(e2prom));
  * Original author "lanchon" from ST forums, with modifications by LeafLabs.
  */
 /* Provide memory region aliases for common.inc */
-REGION_ALIAS("REGION_TEXT", rom);
+REGION_ALIAS("REGION_TEXT", bootloader);
 REGION_ALIAS("REGION_DATA", ram);
 REGION_ALIAS("REGION_BSS", ram);
-REGION_ALIAS("REGION_RODATA", rom);
+REGION_ALIAS("REGION_RODATA", bootloader);
 REGION_ALIAS("REGION_EEPROM", e2prom);
 
 OUTPUT_FORMAT ("elf32-littlearm", "elf32-bigarm", "elf32-littlearm")

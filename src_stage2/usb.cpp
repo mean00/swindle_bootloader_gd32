@@ -1,0 +1,963 @@
+// Stuff copied from libopencm3 and simplified/reworked
+// to make it simpler and fit 4KB
+
+#include <string.h>
+
+#include "usb.h"
+#include "usb_vid_pid.h"
+// Defined in main
+extern uint8_t usbd_control_buffer[1024];
+extern const char *const _usb_strings[5];
+extern enum usbd_request_return_codes usbdfu_control_request(struct usb_setup_data *req, uint16_t *len,
+                                                              void (**complete)(struct usb_setup_data *req));
+
+// Simple builtin fns
+size_t strlen(const char *s)
+{
+    size_t ret = 0;
+    while (*s++)
+        ret++;
+    return ret;
+}
+
+/**
+ * @brief USB device descriptor for the bootloader.
+ *
+ * Declares a DFU-capable device with the VID/PID from usb_vid_pid.h.
+ * String descriptor indices reference entries in _usb_strings[]
+ * (manufacturer, product, serial number).
+ */
+const struct usb_device_descriptor dev_desc = {
+    .bLength = USB_DT_DEVICE_SIZE,
+    .bDescriptorType = USB_DT_DEVICE,
+    .bcdUSB = 0x0200,
+    .bDeviceClass = 0,
+    .bDeviceSubClass = 0,
+    .bDeviceProtocol = 0,
+    .bMaxPacketSize0 = 64,
+    .idVendor = BL_VENDOR_ID,   // 0x1d50,
+    .idProduct = BL_PRODUCT_ID, // 0x6030,
+    .bcdDevice = 0x0200,
+    .iManufacturer = 1,
+    .iProduct = 2,
+    .iSerialNumber = 3,
+    .bNumConfigurations = 1,
+};
+
+/**
+ * @brief Configuration, interface, and DFU functional descriptors packed
+ *        into a single structure for a single-configuration device.
+ *
+ * The interface declares class 0xFE (Device Firmware Upgrade), subclass 1,
+ * protocol 2. The DFU functional descriptor advertises upload/download
+ * capability (conditional on ENABLE_DFU_UPLOAD) and will_detach behaviour.
+ */
+const struct
+{
+    struct usb_config_descriptor config;
+    struct usb_interface_descriptor iface;
+    struct usb_dfu_descriptor dfu_function;
+} config_desc = {
+    .config =
+        {
+            .bLength = USB_DT_CONFIGURATION_SIZE,
+            .bDescriptorType = USB_DT_CONFIGURATION,
+            .wTotalLength = sizeof(config_desc),
+            .bNumInterfaces = 1,
+            .bConfigurationValue = 1,
+            .iConfiguration = 5,
+            .bmAttributes = 0xC0,
+            .bMaxPower = 0x32,
+        },
+    .iface =
+        {
+            .bLength = USB_DT_INTERFACE_SIZE,
+            .bDescriptorType = USB_DT_INTERFACE,
+            .bInterfaceNumber = 0,
+            .bAlternateSetting = 0,
+            .bNumEndpoints = 0,
+            .bInterfaceClass = 0xFE, /* Device Firmware Upgrade */
+            .bInterfaceSubClass = 1,
+            .bInterfaceProtocol = 2,
+            .iInterface = 4,
+        },
+    .dfu_function =
+        {
+            .bLength = sizeof(struct usb_dfu_descriptor),
+            .bDescriptorType = DFU_FUNCTIONAL,
+            .bmAttributes =
+#ifdef ENABLE_DFU_UPLOAD
+                USB_DFU_CAN_UPLOAD |
+#endif
+                USB_DFU_CAN_DOWNLOAD | USB_DFU_WILL_DETACH,
+            .wDetachTimeout = 255,
+            .wTransferSize = DFU_TRANSFER_SIZE,
+            .bcdDFUVersion = 0x011A,
+        },
+};
+
+/**
+ * @brief USB control-transfer FSM states.
+ *
+ * These track the progress of a control transfer through its setup,
+ * data, and status stages.
+ */
+enum
+{
+    IDLE,           /**< No transfer in progress. */
+    STALLED,        /**< Endpoint stalled. */
+    DATA_IN,        /**< Sending data to host (more than one packet). */
+    LAST_DATA_IN,   /**< Sending final data packet to host. */
+    STATUS_IN,      /**< Status stage: device sends an IN ZLP. */
+    DATA_OUT,       /**< Receiving data from host (more than one packet). */
+    LAST_DATA_OUT,  /**< Receiving the final data packet from host. */
+    STATUS_OUT,     /**< Status stage: device receives an OUT ZLP. */
+} usb_fsm_state = IDLE;
+
+/** @brief Remaining data length for the current control transfer (data stage). */
+uint16_t datasize = 0;
+
+/** @brief Offset into usbd_control_buffer for the next IN/OUT chunk. */
+uint16_t dataoff = 0;
+
+/** @brief Top of the USB packet buffer area (allocated from PMA top-down). */
+uint16_t usb_pm_top = 0;
+
+/**
+ * @brief Non-zero if a zero-length packet (ZLP) must be sent after the
+ *        data stage to signal completion.
+ */
+uint8_t usb_needs_zlp = 0;
+
+/** @brief Decoded USB setup packet from the most recent control transfer. */
+struct usb_setup_data usb_req;
+
+/**
+ * @brief Per-endpoint NAK override flags.
+ *
+ * When set for an OUT endpoint, the hardware is kept in NAK instead of
+ * re-arming RX after a packet is read.
+ */
+uint8_t usb_force_nak[8] = {0};
+
+/**
+ * @brief Callback invoked when the current control transfer completes
+ *        its status stage.
+ *
+ */
+void (*usb_complete_cb)(struct usb_setup_data *req) = 0;
+
+#include "lnRCU.h"
+
+#define WAIT_A_BIT()                                                                                                   \
+    {                                                                                                                  \
+        for (int i = 0; i < 100; i++)                                                                                  \
+        {                                                                                                              \
+            __asm__("nop");                                                                                            \
+        }                                                                                                              \
+    }
+
+/**
+ * @brief Initialise the USB peripheral.
+ *
+ * Enables the USB clock via RCU, performs a peripheral reset, clears
+ * the power-down and reset bits in CNTR, and enables the RESET, SUSPEND,
+ * RESUME (wakeup), and CTR (correct-transfer) interrupts.
+ */
+void usb_init()
+{
+    lnPeripherals::enable(pUSB);
+    WAIT_A_BIT();
+    lnPeripherals::reset(pUSB);
+    WAIT_A_BIT();
+
+    // clear close
+    *USB_CNTR_REG &= ~2;
+    WAIT_A_BIT();
+    /// clear reset
+    *USB_CNTR_REG &= ~1;
+    //
+    WAIT_A_BIT();
+    // go
+    SET_REG(USB_CNTR_REG, 0);
+    WAIT_A_BIT();
+    SET_REG(USB_BTABLE_REG, 0);
+    SET_REG(USB_ISTR_REG, 0);
+
+    /* Enable RESET, SUSPEND, RESUME and CTR interrupts. */
+    SET_REG(USB_CNTR_REG, USB_CNTR_RESETM | USB_CNTR_CTRM | USB_CNTR_SUSPM | USB_CNTR_WKUPM);
+}
+
+#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#define USBD_PM_TOP 0x40
+
+/**
+ * @brief Copy data from a system buffer to the USB packet memory area (PMA).
+ *
+ * The STM32/GD32 USB peripheral uses a dedicated SRAM (PMA) for endpoint
+ * buffers. Writes must be 16-bit aligned.
+ *
+ * @param vPM   Destination in PMA (volatile).
+ * @param buf   Source system buffer.
+ * @param len   Number of bytes to copy.
+ */
+static void st_usbfs_copy_to_pm(volatile void *vPM, const void *buf, uint16_t len)
+{
+    const uint16_t *lbuf = (const uint16_t *)buf;
+    volatile uint32_t *PM = (volatile uint32_t *)vPM;
+    for (len = (len + 1) >> 1; len; len--)
+        *PM++ = *lbuf++;
+}
+
+/**
+ * @brief Copy data from the USB packet memory area (PMA) to a system buffer.
+ *
+ * @param buf   Destination system buffer.
+ * @param vPM   Source in PMA (volatile).
+ * @param len   Number of bytes to copy.
+ */
+static void st_usbfs_copy_from_pm(void *buf, const volatile void *vPM, uint16_t len)
+{
+    uint16_t *lbuf = (uint16_t *)buf;
+    const volatile uint16_t *PM = (const volatile uint16_t *)vPM;
+    uint8_t odd = len & 1;
+
+    for (len >>= 1; len; PM += 2, lbuf++, len--)
+        *lbuf = *PM;
+
+    if (odd)
+        *(uint8_t *)lbuf = *(uint8_t *)PM;
+}
+
+/**
+ * @brief Write a packet to an IN endpoint's TX buffer.
+ *
+ * Copies the data to PMA, sets the TX count, and marks the endpoint as
+ * VALID so the USB peripheral transmits it. Returns 0 if the endpoint
+ * is already busy (VALID).
+ *
+ * @param addr  Endpoint address (bit 7 = direction, cleared internally).
+ * @param buf   Data to send.
+ * @param len   Number of bytes to send.
+ * @return Number of bytes accepted for transmission (0 if busy).
+ */
+static uint16_t _usbd_ep_write_packet(uint8_t addr, const void *buf, uint16_t len)
+{
+    addr &= 0x7F;
+
+    if ((*USB_EP_REG(addr) & USB_EP_TX_STAT) == USB_EP_TX_STAT_VALID)
+        return 0;
+
+    st_usbfs_copy_to_pm(USB_GET_EP_TX_BUFF(addr), buf, len);
+    USB_SET_EP_TX_COUNT(addr, len);
+    USB_SET_EP_TX_STAT(addr, USB_EP_TX_STAT_VALID);
+
+    return len;
+}
+
+/**
+ * @brief Read a received packet from an OUT endpoint's RX buffer.
+ *
+ * Copies the data from PMA to a system buffer and re-arms the endpoint
+ * for the next reception (unless force NAK is active).
+ *
+ * @param addr  Endpoint address (bit 7 ignored).
+ * @param buf   Destination buffer.
+ * @param len   Maximum number of bytes to read.
+ * @return Number of bytes received, or 0 if no packet available.
+ */
+static uint16_t _usbd_ep_read_packet(uint8_t addr, void *buf, uint16_t len)
+{
+    if ((*USB_EP_REG(addr) & USB_EP_RX_STAT) == USB_EP_RX_STAT_VALID)
+        return 0;
+
+    len = MIN(USB_GET_EP_RX_COUNT(addr) & 0x3ff, len);
+    st_usbfs_copy_from_pm(buf, USB_GET_EP_RX_BUFF(addr), len);
+    USB_CLR_EP_RX_CTR(addr);
+
+    if (!usb_force_nak[addr])
+    {
+        USB_SET_EP_RX_STAT(addr, USB_EP_RX_STAT_VALID);
+    }
+    return len;
+}
+
+/**
+ * @brief Force an OUT endpoint into (or out of) NAK state.
+ *
+ * While NAKed, the hardware does not accept any packets from the host.
+ * The state is ignored for IN endpoints.
+ *
+ * @param addr  Endpoint address (bit 7 ignored).
+ * @param nak   1 to force NAK, 0 to re-enable reception.
+ */
+static void _usbd_ep_nak_set(uint8_t addr, uint8_t nak)
+{
+    // It does not make sense to force NAK on IN endpoints.
+    if (addr & 0x80)
+        return;
+
+    usb_force_nak[addr] = nak;
+    if (nak)
+        USB_SET_EP_RX_STAT(addr, USB_EP_RX_STAT_NAK);
+    else
+        USB_SET_EP_RX_STAT(addr, USB_EP_RX_STAT_VALID);
+}
+
+/**
+ * @brief Set or clear the STALL condition on an endpoint.
+ *
+ * @param addr   Endpoint address (bit 7 indicates IN direction).
+ * @param stall  1 to STALL, 0 to clear STALL and reset DATA toggle.
+ */
+static void _ep_stall_set(uint8_t addr, uint8_t stall)
+{
+    if (addr == 0)
+        USB_SET_EP_TX_STAT(addr, stall ? USB_EP_TX_STAT_STALL : USB_EP_TX_STAT_NAK);
+
+    if (addr & 0x80)
+    {
+        addr &= 0x7F;
+
+        USB_SET_EP_TX_STAT(addr, stall ? USB_EP_TX_STAT_STALL : USB_EP_TX_STAT_NAK);
+
+        // Reset to DATA0 if clearing stall condition.
+        if (!stall)
+            USB_CLR_EP_TX_DTOG(addr);
+    }
+    else
+    {
+        // Reset to DATA0 if clearing stall condition.
+        if (!stall)
+            USB_CLR_EP_RX_DTOG(addr);
+
+        USB_SET_EP_RX_STAT(addr, stall ? USB_EP_RX_STAT_STALL : USB_EP_RX_STAT_VALID);
+    }
+}
+
+/**
+ * @brief Test whether an endpoint is currently stalled.
+ *
+ * @param addr  Endpoint address (bit 7 indicates IN direction).
+ * @return 1 if stalled, 0 otherwise.
+ */
+static uint8_t _ep_stall_get(uint8_t addr)
+{
+    if (addr & 0x80)
+    {
+        if ((*USB_EP_REG(addr & 0x7F) & USB_EP_TX_STAT) == USB_EP_TX_STAT_STALL)
+            return 1;
+    }
+    else
+    {
+        if ((*USB_EP_REG(addr) & USB_EP_RX_STAT) == USB_EP_RX_STAT_STALL)
+            return 1;
+    }
+    return 0;
+}
+
+/**
+ * @brief Stall endpoint 0 (the control endpoint) and return the FSM to IDLE.
+ *
+ * Used to abort an unsupported or malformed control request.
+ */
+static inline void _stall_transaction()
+{
+    _ep_stall_set(0, 1);
+    usb_fsm_state = IDLE;
+}
+
+/**
+ * @brief Send the next chunk of control-IN data to the host.
+ *
+ * Sends up to bMaxPacketSize0 bytes. If no more data remains, advances
+ * the FSM to LAST_DATA_IN (or inserts a ZLP if needed).
+ */
+static void usb_control_send_chunk()
+{
+    if (dev_desc.bMaxPacketSize0 < datasize)
+    {
+        /* Data stage, normal transmission */
+        _usbd_ep_write_packet(0, &usbd_control_buffer[dataoff], dev_desc.bMaxPacketSize0);
+        usb_fsm_state = DATA_IN;
+        dataoff += dev_desc.bMaxPacketSize0;
+        datasize -= dev_desc.bMaxPacketSize0;
+    }
+    else
+    {
+        /* Data stage, end of transmission */
+        _usbd_ep_write_packet(0, &usbd_control_buffer[dataoff], datasize);
+
+        usb_fsm_state = usb_needs_zlp ? DATA_IN : LAST_DATA_IN;
+        usb_needs_zlp = 0;
+        datasize = 0;
+    }
+}
+
+/**
+ * @brief Receive the next chunk of control-OUT data from the host.
+ *
+ * Reads the incoming packet into usbd_control_buffer. If the received
+ * size does not match the expected packet size (clamped to wLength),
+ * the endpoint is stalled.
+ *
+ * @return The number of bytes received, or -1 on error (stall).
+ */
+static int usb_control_recv_chunk()
+{
+    uint16_t packetsize = MIN(dev_desc.bMaxPacketSize0, usb_req.wLength - datasize);
+    uint16_t size = _usbd_ep_read_packet(0, &usbd_control_buffer[datasize], packetsize);
+
+    if (size != packetsize)
+    {
+        _stall_transaction();
+        return -1;
+    }
+
+    datasize += size;
+    return packetsize;
+}
+
+/**
+ * @brief Handle standard GET_DESCRIPTOR requests.
+ *
+ * Supports device descriptor, configuration descriptor, and
+ * string descriptors (language ID + manufacturer/product/serial).
+ *
+ * @return USBD_REQ_HANDLED on success, USBD_REQ_NOTSUPP for unknown
+ *         descriptor types or out-of-range string indices.
+ */
+static enum usbd_request_return_codes usb_standard_get_descriptor()
+{
+    int array_idx, descr_idx, descr_type;
+    struct usb_string_descriptor *sd = (struct usb_string_descriptor *)usbd_control_buffer;
+
+    descr_idx = usb_req.wValue & 0xFF;
+    descr_type = usb_req.wValue >> 8;
+
+    switch (descr_type)
+    {
+    case USB_DT_DEVICE:
+        memcpy(usbd_control_buffer, &dev_desc, sizeof(dev_desc));
+        datasize = sizeof(dev_desc);
+        return USBD_REQ_HANDLED;
+    case USB_DT_CONFIGURATION:
+        memcpy(usbd_control_buffer, &config_desc, sizeof(config_desc));
+        datasize = sizeof(config_desc);
+        return USBD_REQ_HANDLED;
+    case USB_DT_STRING:
+        sd->bDescriptorType = USB_DT_STRING;
+        if (descr_idx == 0)
+        {
+            /* Send sane Language ID descriptor... */
+            sd->wData[0] = USB_LANGID_ENGLISH_US;
+            datasize = sd->bLength = sizeof(sd->bLength) + sizeof(sd->bDescriptorType) + sizeof(sd->wData[0]);
+        }
+        else
+        {
+            array_idx = descr_idx - 1;
+
+            /* Check that string index is in range. */
+            if (array_idx >= sizeof(_usb_strings) / sizeof(_usb_strings[0]))
+                return USBD_REQ_NOTSUPP;
+
+            /* Strings with Language ID differnet from
+             * USB_LANGID_ENGLISH_US are not supported */
+            if (usb_req.wIndex != USB_LANGID_ENGLISH_US)
+                return USBD_REQ_NOTSUPP;
+
+            /* This string is returned as UTF16, hence the
+             * multiplication
+             */
+            unsigned numchars = strlen(_usb_strings[array_idx]);
+            datasize = sd->bLength = numchars * 2 + sizeof(sd->bLength) + sizeof(sd->bDescriptorType);
+
+            for (int i = 0; i < numchars; i++)
+                sd->wData[i] = _usb_strings[array_idx][i];
+        }
+        return USBD_REQ_HANDLED;
+    }
+    return USBD_REQ_NOTSUPP;
+}
+
+/**
+ * @brief Handle standard device-request codes.
+ *
+ * Implements SET_ADDRESS, SET_CONFIGURATION, GET_CONFIGURATION,
+ * GET_DESCRIPTOR, and GET_STATUS.
+ *
+ * @return USBD_REQ_HANDLED or USBD_REQ_NOTSUPP.
+ */
+static enum usbd_request_return_codes _usbd_standard_request_device()
+{
+    switch (usb_req.bRequest)
+    {
+    case USB_REQ_SET_ADDRESS:
+        /* The actual address is only latched at the STATUS IN stage. */
+        if ((usb_req.bmRequestType != 0) || (usb_req.wValue >= 128))
+            return USBD_REQ_NOTSUPP;
+
+        // Do not set addr here, wait for status IN
+        // SET_REG(USB_DADDR_REG, (usb_req.wValue & USB_DADDR_ADDR) | USB_DADDR_EF);
+
+        return USBD_REQ_HANDLED;
+    case USB_REQ_SET_CONFIGURATION:
+        // Reset all endpoints
+        if (usb_req.wValue == config_desc.config.bConfigurationValue)
+        {
+            for (int i = 1; i < 8; i++)
+            {
+                USB_SET_EP_TX_STAT(i, USB_EP_TX_STAT_DISABLED);
+                USB_SET_EP_RX_STAT(i, USB_EP_RX_STAT_DISABLED);
+            }
+            usb_pm_top = USBD_PM_TOP + (2 * dev_desc.bMaxPacketSize0);
+            return USBD_REQ_HANDLED;
+        }
+        return USBD_REQ_NOTSUPP;
+    case USB_REQ_GET_CONFIGURATION:
+        usbd_control_buffer[0] = 1; // FIXME?
+        datasize = 1;
+        return USBD_REQ_HANDLED;
+    case USB_REQ_GET_DESCRIPTOR:
+        return usb_standard_get_descriptor();
+    case USB_REQ_GET_STATUS:
+        // GET_STATUS always responds with zero reply.
+        datasize = 2;
+        usbd_control_buffer[0] = 0;
+        usbd_control_buffer[1] = 0;
+        return USBD_REQ_HANDLED;
+    }
+
+    return USBD_REQ_NOTSUPP;
+}
+
+/**
+ * @brief Handle standard interface-request codes.
+ *
+ * Implements GET_INTERFACE, SET_INTERFACE, and GET_STATUS.
+ *
+ * @return USBD_REQ_HANDLED or USBD_REQ_NOTSUPP.
+ */
+static enum usbd_request_return_codes _usbd_standard_request_interface()
+{
+    switch (usb_req.bRequest)
+    {
+    case USB_REQ_GET_INTERFACE:
+        // command = usb_standard_get_interface;
+        usbd_control_buffer[0] = 1;
+        datasize = 1;
+        return USBD_REQ_HANDLED;
+    case USB_REQ_SET_INTERFACE:
+        datasize = 0;
+        return USBD_REQ_HANDLED;
+    case USB_REQ_GET_STATUS:
+        datasize = 2;
+        usbd_control_buffer[0] = 0;
+        usbd_control_buffer[1] = 0;
+        break;
+    }
+    return USBD_REQ_NOTSUPP;
+}
+
+/**
+ * @brief Handle standard endpoint-request codes.
+ *
+ * Implements SET/CLEAR_FEATURE (ENDPOINT_HALT) and GET_STATUS.
+ *
+ * @return USBD_REQ_HANDLED or USBD_REQ_NOTSUPP.
+ */
+static enum usbd_request_return_codes _usbd_standard_request_endpoint()
+{
+    switch (usb_req.bRequest)
+    {
+    case USB_REQ_CLEAR_FEATURE:
+    case USB_REQ_SET_FEATURE:
+        if (usb_req.wValue == USB_FEAT_ENDPOINT_HALT)
+            _ep_stall_set(usb_req.wIndex, usb_req.bRequest == USB_REQ_SET_FEATURE);
+        else
+            return USBD_REQ_NOTSUPP;
+        return USBD_REQ_HANDLED;
+    case USB_REQ_GET_STATUS:
+        usbd_control_buffer[0] = _ep_stall_get(usb_req.wIndex) ? 1 : 0;
+        usbd_control_buffer[1] = 0;
+        datasize = 2;
+        return USBD_REQ_HANDLED;
+    }
+    return USBD_REQ_NOTSUPP;
+}
+
+/**
+ * @brief Dispatch a standard request based on its recipient.
+ *
+ * Routes to the device, interface, or endpoint handler.
+ *
+ * @return USBD_REQ_HANDLED or USBD_REQ_NOTSUPP.
+ */
+static enum usbd_request_return_codes _usbd_standard_request()
+{
+    if ((usb_req.bmRequestType & USB_REQ_TYPE_TYPE) != USB_REQ_TYPE_STANDARD)
+        return USBD_REQ_NOTSUPP;
+
+    switch (usb_req.bmRequestType & USB_REQ_TYPE_RECIPIENT)
+    {
+    case USB_REQ_TYPE_DEVICE:
+        return _usbd_standard_request_device();
+    case USB_REQ_TYPE_INTERFACE:
+        return _usbd_standard_request_interface();
+    case USB_REQ_TYPE_ENDPOINT:
+        return _usbd_standard_request_endpoint();
+    }
+    return USBD_REQ_NOTSUPP;
+}
+
+/**
+ * @brief Dispatch a USB control request to the appropriate handler.
+ *
+ * If the request matches the DFU class/interface combination,
+ * it is forwarded to usbdfu_control_request() in dfu.cpp.
+ * Otherwise it falls through to the standard request handler.
+ *
+ * @return USBD_REQ_HANDLED, USBD_REQ_NOTSUPP, or USBD_REQ_NEXT_CALLBACK.
+ */
+static enum usbd_request_return_codes usb_control_request_dispatch()
+{
+    // Filter out
+    const uint8_t type = USB_REQ_TYPE_CLASS | USB_REQ_TYPE_INTERFACE;
+    const uint8_t mask = USB_REQ_TYPE_TYPE | USB_REQ_TYPE_RECIPIENT;
+    if ((usb_req.bmRequestType & mask) == type)
+    {
+        datasize = usb_req.wLength;
+        usbd_request_return_codes result = usbdfu_control_request(&usb_req, &datasize, &usb_complete_cb);
+        if (result == USBD_REQ_HANDLED || result == USBD_REQ_NOTSUPP)
+            return result;
+    }
+
+    /* Try standard request if not already handled. */
+    return _usbd_standard_request();
+}
+
+/**
+ * @brief Determine whether a zero-length packet (ZLP) is needed after
+ *        the data stage.
+ *
+ * A ZLP is required when the data length is less than the host-requested
+ * wLength and is an exact multiple of the endpoint packet size.
+ *
+ * @param len       Actual data length sent/received.
+ * @param wLength   Length requested by the host in the setup packet.
+ * @param ep_size   Endpoint max packet size.
+ * @return 1 if a ZLP is needed, 0 otherwise.
+ */
+static uint8_t _needs_zlp(uint16_t len, uint16_t wLength, uint8_t ep_size)
+{
+    if (len < wLength)
+    {
+        if (len && (len % ep_size == 0))
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
+ * @brief Handle the setup stage of a control read (device-to-host)
+ *        transfer.
+ *
+ * Dispatches the request and, if handled, begins sending data via
+ * usb_control_send_chunk() or transitions to the STATUS_IN stage.
+ * On failure, stalls endpoint 0.
+ */
+static void _usb_control_setup_read()
+{
+    unsigned maxdataout = usb_req.wLength;
+
+    dataoff = 0; // Restart transmission counter
+    if (usb_control_request_dispatch())
+    {
+        if (datasize > maxdataout) // Truncate output
+            datasize = maxdataout;
+
+        if (maxdataout)
+        {
+            usb_needs_zlp = _needs_zlp(datasize, maxdataout, dev_desc.bMaxPacketSize0);
+            /* Go to data out stage if handled. */
+            usb_control_send_chunk();
+        }
+        else
+        {
+            /* Go to status stage if handled. */
+            _usbd_ep_write_packet(0, 0, 0);
+            usb_fsm_state = STATUS_IN;
+        }
+    }
+    else
+        _stall_transaction(); // Stall endpoint on failure.
+}
+
+/**
+ * @brief Handle the setup stage of a control write (host-to-device)
+ *        transfer.
+ *
+ * Validates that the requested data length fits in the buffer, then
+ * transitions to DATA_OUT or LAST_DATA_OUT to receive the payload.
+ */
+static void _usb_control_setup_write()
+{
+    // Stall EP if we have too much data?
+    if (usb_req.wLength > sizeof(usbd_control_buffer))
+    {
+        _stall_transaction();
+        return;
+    }
+
+    /* Buffer into which to write received data. */
+    datasize = 0;
+    /* Wait for DATA OUT stage. */
+    if (usb_req.wLength > dev_desc.bMaxPacketSize0)
+        usb_fsm_state = DATA_OUT;
+    else
+        usb_fsm_state = LAST_DATA_OUT;
+
+    _usbd_ep_nak_set(0, 0);
+}
+
+/**
+ * @brief Handle a SETUP transaction on endpoint 0.
+ *
+ * Reads the 8-byte setup packet from the endpoint's RX buffer,
+ * clears the completion callback, NAKs endpoint 0, and dispatches
+ * to the read or write handler based on the bmRequestType direction bit.
+ */
+static void _usbd_control_setup()
+{
+    usb_complete_cb = 0;
+    _usbd_ep_nak_set(0, 1);
+
+    if (_usbd_ep_read_packet(0, &usb_req, sizeof(usb_req)) != sizeof(usb_req))
+    {
+        _stall_transaction();
+        return;
+    }
+
+    if ((usb_req.wLength == 0) || (usb_req.bmRequestType & 0x80))
+        _usb_control_setup_read();
+    else
+        _usb_control_setup_write();
+}
+
+/**
+ * @brief Handle an OUT transaction on endpoint 0 (data from host).
+ *
+ * Receives data chunks until the full wLength has been transferred,
+ * then dispatches the request and sends a status-stage ZLP.
+ * On completion of the status OUT stage, invokes the registered
+ * complete callback (if any).
+ */
+static void _usbd_control_out()
+{
+    switch (usb_fsm_state)
+    {
+    case DATA_OUT:
+        if (usb_control_recv_chunk() < 0)
+            break;
+
+        // Check for last packet
+        if ((usb_req.wLength - datasize) <= dev_desc.bMaxPacketSize0)
+            usb_fsm_state = LAST_DATA_OUT;
+        break;
+    case LAST_DATA_OUT:
+        if (usb_control_recv_chunk() < 0)
+            break;
+        /*
+         * We have now received the full data payload.
+         * Invoke callback to process.
+         */
+        if (usb_control_request_dispatch())
+        {
+            /* Go to status stage on success. */
+            _usbd_ep_write_packet(0, 0, 0);
+            usb_fsm_state = STATUS_IN;
+        }
+        else
+            _stall_transaction();
+        break;
+    case STATUS_OUT:
+        _usbd_ep_read_packet(0, 0, 0);
+        usb_fsm_state = IDLE;
+        if (usb_complete_cb)
+            usb_complete_cb(&usb_req);
+
+        usb_complete_cb = 0;
+        break;
+    default:
+        _stall_transaction();
+    }
+}
+
+/**
+ * @brief Handle an IN transaction on endpoint 0 (data to host).
+ *
+ * Continues sending data chunks until the data stage is complete,
+ * then transitions to the STATUS_OUT stage. On STATUS_IN completion,
+ * the registered callback is invoked and the SET_ADDRESS function
+ * is applied (if the pending request was SET_ADDRESS).
+ */
+static void _usbd_control_in()
+{
+    switch (usb_fsm_state)
+    {
+    case DATA_IN:
+        usb_control_send_chunk();
+        break;
+    case LAST_DATA_IN:
+        usb_fsm_state = STATUS_OUT;
+        _usbd_ep_nak_set(0, 0);
+        break;
+    case STATUS_IN:
+        if (usb_complete_cb)
+            usb_complete_cb(&usb_req);
+
+        /* Exception: Handle SET ADDRESS function here... */
+        if ((usb_req.bmRequestType == 0) && (usb_req.bRequest == USB_REQ_SET_ADDRESS))
+        {
+            /* Set device address and enable. */
+            SET_REG(USB_DADDR_REG, (usb_req.wValue & USB_DADDR_ADDR) | USB_DADDR_EF);
+        }
+        usb_fsm_state = IDLE;
+        break;
+    default:
+        _stall_transaction();
+    }
+}
+
+/**
+ * @brief Configure the RX buffer size register for an endpoint.
+ *
+ * The STM32/GD32 USB peripheral encodes the buffer size differently
+ * depending on whether it exceeds 62 bytes.
+ *
+ * @param ep    Endpoint number.
+ * @param size  Desired RX buffer size in bytes.
+ */
+static void _set_ep_rx_bufsize(uint8_t ep, uint32_t size)
+{
+    if (size > 62)
+    {
+        if (size & 0x1f)
+        {
+            size -= 32;
+        }
+        USB_SET_EP_RX_COUNT(ep, (size << 5) | 0x8000);
+    }
+    else
+    {
+        if (size & 1)
+        {
+            size++;
+        }
+        USB_SET_EP_RX_COUNT(ep, size << 10);
+    }
+}
+
+/**
+ * @brief Set up an endpoint with the given type and max packet size.
+ *
+ * Allocates PMA space for TX and/or RX buffers, configures the
+ * endpoint type, and enables the endpoint (RX VALID, TX NAK for IN
+ * or bidirectional endpoints).
+ *
+ * @param addr      Endpoint address (bit 7 = direction, 0..7 for the number).
+ * @param type      USB endpoint type (CONTROL, BULK, ISO, INTERRUPT).
+ * @param max_size  Max packet size in bytes.
+ */
+static void _usbd_ep_setup(uint8_t addr, uint8_t type, uint16_t max_size)
+{
+    /* Translate USB standard type codes to STM32. */
+    const uint16_t typelookup[] = {
+        [USB_ENDPOINT_ATTR_CONTROL] = USB_EP_TYPE_CONTROL,
+        [USB_ENDPOINT_ATTR_ISOCHRONOUS] = USB_EP_TYPE_ISO,
+        [USB_ENDPOINT_ATTR_BULK] = USB_EP_TYPE_BULK,
+        [USB_ENDPOINT_ATTR_INTERRUPT] = USB_EP_TYPE_INTERRUPT,
+    };
+    uint8_t dir = addr & 0x80;
+    addr &= 0x7f;
+
+    /* Assign address. */
+    USB_SET_EP_ADDR(addr, addr);
+    USB_SET_EP_TYPE(addr, typelookup[type]);
+
+    if (dir || (addr == 0))
+    {
+        USB_SET_EP_TX_ADDR(addr, usb_pm_top);
+        USB_CLR_EP_TX_DTOG(addr);
+        USB_SET_EP_TX_STAT(addr, USB_EP_TX_STAT_NAK);
+        usb_pm_top += max_size;
+    }
+
+    if (!dir)
+    {
+        USB_SET_EP_RX_ADDR(addr, usb_pm_top);
+        _set_ep_rx_bufsize(addr, max_size);
+        USB_CLR_EP_RX_DTOG(addr);
+        USB_SET_EP_RX_STAT(addr, USB_EP_RX_STAT_VALID);
+        usb_pm_top += max_size;
+    }
+}
+
+/**
+ * @brief Poll the USB peripheral and process pending events.
+ *
+ * Reads the ISTR (Interrupt Status) register and dispatches:
+ *  - RESET: reinitialises endpoint 0 and resets the device address.
+ *  - CTR (correct transfer): handles SETUP, OUT, or IN transactions
+ *    based on the direction and EP_SETUP flags.
+ *  - SUSP/WKUP/SOF: clears the corresponding status bits.
+ *
+ * This function must be called periodically from the main loop
+ * (poll-based USB stack, no interrupts used).
+ */
+void do_usb_poll()
+{
+    uint16_t istr = *USB_ISTR_REG;
+
+    if (istr & USB_ISTR_RESET)
+    {
+        USB_CLR_ISTR_RESET();
+        usb_pm_top = USBD_PM_TOP;
+
+        _usbd_ep_setup(0, USB_ENDPOINT_ATTR_CONTROL, dev_desc.bMaxPacketSize0);
+        // Set driver addr to zero
+        SET_REG(USB_DADDR_REG, 0 | USB_DADDR_EF);
+
+        return;
+    }
+
+    if (istr & USB_ISTR_CTR)
+    {
+        uint8_t ep = istr & USB_ISTR_EP_ID;
+        if (istr & USB_ISTR_DIR)
+        {
+            if (*USB_EP_REG(ep) & USB_EP_SETUP)
+                _usbd_control_setup();
+            else
+                _usbd_control_out();
+        }
+        else
+        {
+            USB_CLR_EP_TX_CTR(ep);
+            _usbd_control_in();
+        }
+    }
+
+    if (istr & USB_ISTR_SUSP)
+        USB_CLR_ISTR_SUSP();
+
+    if (istr & USB_ISTR_WKUP)
+        USB_CLR_ISTR_WKUP();
+
+    if (istr & USB_ISTR_SOF)
+        USB_CLR_ISTR_SOF();
+
+    *USB_CNTR_REG &= ~USB_CNTR_SOFM;
+}
