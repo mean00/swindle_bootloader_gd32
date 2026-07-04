@@ -59,7 +59,7 @@ enable_language(C CXX ASM) # this is important too!
 include_directories(${CMAKE_SOURCE_DIR})
 include_directories(${CMAKE_BINARY_DIR})
 
-ADD_DEFINITIONS("-DVERSION=\"0.0\"")
+ADD_DEFINITIONS("-DVERSION=\"0.1\"")
 set(LN_EXT "arm_gd32fx" CACHE INTERNAL "")
 
 include(lnCmake)

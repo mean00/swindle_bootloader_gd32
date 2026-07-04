@@ -70,14 +70,10 @@ RUN export PATH=$PATH:\$HOME/.local/bin &&  mkdir -p /home/$USERNAME/.local/bin 
             && rustup target add --toolchain nightly-x86_64-unknown-linux-gnu   thumbv7em-none-eabihf  \
             && rustup target add --toolchain nightly-x86_64-unknown-linux-gnu   thumbv8m.main-none-eabi 
 
-# Install riscv toolchain (llvm)
-RUN  wget -O - https://github.com/mean00/LLVM-embedded-toolchain-for-rv32/releases/download/19.1.5/LLVM_RV32_Linux_ubuntu_19.1.5.tar.gz | tar -xz -C /riscv && mv /riscv/LLVM_RV32_Linux_ubuntu_19.1.5 /riscv/llvm_19.1 
-# Install arm toolchain (llvm)
-RUN  wget -O - https://github.com/ARM-software/LLVM-embedded-toolchain-for-Arm/releases/download/release-19.1.5/LLVM-ET-Arm-19.1.5-Linux-x86_64.tar.xz | xz -d -c  | tar -x -C /arm && mv /arm/LLVM-ET-Arm-19.1.5-Linux-x86_64  /arm/llvm_19.1 \
-              && cd /arm/llvm_19.1/bin && ln -s clang++ clang++-19
-# RP PICO SDK
-RUN            cd /opt/pico && git clone https://github.com/raspberrypi/pico-sdk.git \
-            && cd /opt/pico/pico-sdk/tools/pioasm && mkdir build && cd build && cmake -DPIOASM_VERSION_STRING="blah" .. && make && cp pioasm $HOME/.local/bin \
-            && cd /opt/pico/ && git clone https://github.com/raspberrypi/picotool.git && cd picotool && mkdir build && cd build && cmake -DPICO_SDK_PATH=/opt/pico/pico-sdk .. && make && cp picotool  $HOME/.local/bin
+RUN  wget -nv --no-proxy -O - https://github.com/mean00/clang_arm_devcontainer/releases/download/v0.1/clang_toolchain_arm_21.1.1_x86_64_ubuntu.24_04.tar.bz2  \
+  | bzip2 -dc   | tar -x -C /arm && mv /arm/ATfE-21.1.1-Linux-x86_64   /arm/llvm_21.1 \
+            && cd /arm/llvm_21.1/bin && ln -s clang++ clang++-21
+
+
 
 
