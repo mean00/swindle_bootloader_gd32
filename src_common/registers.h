@@ -1,6 +1,6 @@
 #pragma once
 
-#define APP_ADDRESS (FLASH_BASE_ADDR + (FLASH_BOOTLDR_SIZE_KB)*1024)
+#define APP_ADDRESS (FLASH_BASE_ADDR + (FLASH_BOOTLDR_SIZE_KB) * 1024)
 
 #define RCC_CSR (*(volatile uint32_t *)0x40021024U)
 #define RCC_CSR_LPWRRSTF (1 << 31)
@@ -12,7 +12,13 @@
 #define RCC_CSR_RMVF (1 << 24)
 
 #define configTICK_RATE_HZ 1000
+#ifdef USE_GD32_CRYSTALLESS
+/* HSI/2 × 9 = 36 MHz */
+#define configSYSTICK_CLOCK_HZ (36 * 1000 * 1000)
+#else
+/* HSE 8 MHz × 9 = 72 MHz */
 #define configSYSTICK_CLOCK_HZ (72 * 1000 * 1000)
+#endif
 
 #define portNVIC_SYSTICK_CTRL_REG (*((volatile uint32_t *)0xe000e010))
 #define portNVIC_SYSTICK_LOAD_REG (*((volatile uint32_t *)0xe000e014))

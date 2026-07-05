@@ -252,7 +252,7 @@ enum usb_language_id
 };
 
 /* Get register content. */
-#define GET_REG(REG) ((uint16_t) * (REG))
+#define GET_REG(REG) ((uint16_t)*(REG))
 
 /* Set register content. */
 #define SET_REG(REG, VAL) (*(REG) = (uint16_t)(VAL))
@@ -471,6 +471,6 @@ enum usb_language_id
 #define USB_CLR_EP_TX_CTR(EP) USB_CLR_EP_NTOGGLE_BIT_AND_SET(EP, USB_EP_TX_CTR, USB_EP_RX_CTR)
 
 // Exported API
-#define DFU_TRANSFER_SIZE 1024
+#define DFU_TRANSFER_SIZE 4096
 void usb_init();
 void do_usb_poll();

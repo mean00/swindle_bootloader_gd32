@@ -1,5 +1,7 @@
 
 // Flashing routines //
+#include "flash_config.h"
+#include "lnCpuID.h"
 #include "stdint.h"
 #define FLASH_CR_LOCK (1 << 7)
 #define FLASH_CR_STRT (1 << 6)
@@ -8,6 +10,9 @@
 #define FLASH_CR_PER (1 << 1)
 #define FLASH_CR_PG (1 << 0)
 #define FLASH_SR_BSY (1 << 0)
+
+/** Flash page erase size in bytes. Must match the MCU's minimum erase granule. */
+#define FLASH_PAGE_SIZE 1024
 struct LN_FMCx
 {
     uint32_t WS;     // 00 ACR
@@ -32,9 +37,6 @@ typedef volatile LN_FMCx LN_FMC;
 
 static void _flash_unlock(int opt)
 {
-    // Clear the unlock state.
-    FLASH_CR |= FLASH_CR_LOCK;
-
     // Authorize the FPEC access.
     FLASH_KEYR = 0x45670123U;
     FLASH_KEYR = 0xcdef89abU;
@@ -72,7 +74,7 @@ static void _flash_erase_page(uint32_t page_address)
 static int _flash_page_is_erased(uint32_t addr)
 {
     volatile uint32_t *_ptr32 = (uint32_t *)addr;
-    for (unsigned i = 0; i < 1024 / sizeof(uint32_t); i++)
+    for (unsigned i = 0; i < FLASH_PAGE_SIZE / sizeof(uint32_t); i++)
         if (_ptr32[i] != 0xffffffffU)
             return 0;
     return 1;
@@ -169,9 +171,9 @@ static void check_do_erase()
         return;
 
     /* Change usb_strings accordingly */
-    const uint32_t start_addr = 0x08000000 + (FLASH_BOOTLDR_SIZE_KB * 1024);
-    const uint32_t end_addr = 0x08000000 + (FLASH_SIZE_KB * 1024);
-    for (uint32_t addr = start_addr; addr < end_addr; addr += 1024)
+    const uint32_t start_addr = FLASH_BASE_ADDR + (FLASH_BOOTLDR_SIZE_KB * 1024);
+    const uint32_t end_addr = FLASH_BASE_ADDR + (lnCpuID::flashSize() * 1024);
+    for (uint32_t addr = start_addr; addr < end_addr; addr += FLASH_PAGE_SIZE)
         if (!_flash_page_is_erased(addr))
             _flash_erase_page(addr);
 

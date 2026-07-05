@@ -10,6 +10,13 @@
 #include "usb.h"
 #include "usb_vid_pid.h"
 #include <cstdint>
+
+/** Read a 32-bit little-endian value from any (possibly unaligned) address. */
+static inline uint32_t read_u32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
 /**
  * @defgroup dfu_commands ST DfuSe command codes
  *
@@ -109,25 +116,22 @@ static int is_gd32(void)
 static void prepare_memory_layout()
 {
     int flash_size = lnCpuID::flashSize();
-    const char *s;
-    switch (flash_size)
-    {
-    case 64:
-        s = "52";
-        break; // 64-8-4
-    case 256:
-        s = "244";
-        break; // 64-8-4
-    default:
-    case 128:
-        s = "116";
-        break; // 64-8-4
-    }
+    int user_kb = flash_size - FLASH_BOOTLDR_SIZE_KB;
 
     xstrcpy(memory_layout, "@Internal Flash /0x08000000/");
     xstrcat(memory_layout, BOOTLOADER_SIZE_STR);
     xstrcat(memory_layout, "*001Ka,");
-    xstrcat(memory_layout, s); //"116");
+
+    /* Convert user_kb to decimal string. */
+    char num[8];
+    char *p = num + sizeof(num) - 1;
+    *p = 0;
+    do
+    {
+        *--p = '0' + (user_kb % 10);
+        user_kb /= 10;
+    } while (user_kb);
+    xstrcat(memory_layout, p);
     xstrcat(memory_layout, "*001Kg");
 }
 
@@ -175,7 +179,7 @@ static void get_dev_unique_id(char *s)
  * @param[out] bwPollTimeout  Poll timeout in ms (24-bit value per DFU spec).
  * @return DFU_STATUS_OK on success, DFU_STATUS_ERR_* otherwise.
  */
-static uint8_t usbdfu_getstatus(uint32_t *bwPollTimeout)
+static enum dfu_status usbdfu_getstatus(uint32_t *bwPollTimeout)
 {
     switch (usbdfu_state)
     {
@@ -188,7 +192,8 @@ static uint8_t usbdfu_getstatus(uint32_t *bwPollTimeout)
         usbdfu_state = STATE_DFU_MANIFEST;
         return DFU_STATUS_OK;
     case STATE_DFU_ERROR:
-        return STATE_DFU_ERROR;
+        // STATE_DFU_ERROR;
+        return DFU_STATUS_ERR_UNKNOWN;
     default:
         return DFU_STATUS_OK;
     }
@@ -217,8 +222,8 @@ static void usbdfu_getstatus_complete(struct usb_setup_data *req)
 
     // Protect the flash by only writing to the valid flash area
     const int flash_size = lnCpuID::flashSize(); // in kB
-    const uint32_t start_addr = 0x08000000 + (FLASH_BOOTLDR_SIZE_KB * 1024);
-    const uint32_t end_addr = 0x08000000 + (flash_size * 1024);
+    const uint32_t start_addr = FLASH_BASE_ADDR + (FLASH_BOOTLDR_SIZE_KB * 1024);
+    const uint32_t end_addr = FLASH_BASE_ADDR + (flash_size * 1024);
 
     switch (usbdfu_state)
     {
@@ -234,7 +239,7 @@ static void usbdfu_getstatus_complete(struct usb_setup_data *req)
 #endif
 
                 // Clear this page here.
-                uint32_t baseaddr = *(uint32_t *)(prog.buf + 1);
+                uint32_t baseaddr = read_u32(prog.buf + 1);
                 if (baseaddr >= start_addr && baseaddr + DFU_TRANSFER_SIZE <= end_addr)
                 {
                     if (!_flash_page_is_erased(baseaddr))
@@ -244,7 +249,7 @@ static void usbdfu_getstatus_complete(struct usb_setup_data *req)
             break;
             case CMD_SETADDR:
                 // Assuming little endian here.
-                prog.addr = *(uint32_t *)(prog.buf + 1);
+                prog.addr = read_u32(prog.buf + 1);
                 break;
             }
         }
@@ -259,11 +264,13 @@ static void usbdfu_getstatus_complete(struct usb_setup_data *req)
 
             if (baseaddr >= start_addr && baseaddr + prog.len <= end_addr)
             {
-                // Program buffer in one go after erasing.
-                if (!_flash_page_is_erased(baseaddr))
-                    _flash_erase_page(baseaddr);
+                // Erase each hardware page in the transfer range, then
+                // program the full chunk in one go.
+                for (uint32_t page = baseaddr; page < baseaddr + prog.len; page += FLASH_PAGE_SIZE)
+                    if (!_flash_page_is_erased(page))
+                        _flash_erase_page(page);
                 if (gd32)
-                    _flash_program_buffer(baseaddr, (uint16_t *)prog.buf, prog.len);
+                    _flash_program_buffer_gd32(baseaddr, (uint16_t *)prog.buf, prog.len);
                 else
                     _flash_program_buffer(baseaddr, (uint16_t *)prog.buf, prog.len);
             }
@@ -351,8 +358,8 @@ enum usbd_request_return_codes usbdfu_control_request(struct usb_setup_data *req
 #else
             // From formula Address_Pointer + ((wBlockNum - 2)*wTransferSize)
             uint32_t baseaddr = prog.addr + ((req->wValue - 2) * DFU_TRANSFER_SIZE);
-            const uint32_t start_addr = 0x08000000 + (FLASH_BOOTLDR_SIZE_KB * 1024);
-            const uint32_t end_addr = 0x08000000 + (FLASH_SIZE_KB * 1024);
+            const uint32_t start_addr = FLASH_BASE_ADDR + (FLASH_BOOTLDR_SIZE_KB * 1024);
+            const uint32_t end_addr = FLASH_BASE_ADDR + (lnCpuID::flashSize() * 1024);
             if (baseaddr >= start_addr && baseaddr + DFU_TRANSFER_SIZE <= end_addr)
             {
                 memcpy(usbd_control_buffer, (void *)baseaddr, DFU_TRANSFER_SIZE);

@@ -6,10 +6,10 @@
 #include "usb.h"
 #include "usb_vid_pid.h"
 // Defined in main
-extern uint8_t usbd_control_buffer[1024];
+extern uint8_t usbd_control_buffer[DFU_TRANSFER_SIZE];
 extern const char *const _usb_strings[5];
 extern enum usbd_request_return_codes usbdfu_control_request(struct usb_setup_data *req, uint16_t *len,
-                                                              void (**complete)(struct usb_setup_data *req));
+                                                             void (**complete)(struct usb_setup_data *req));
 
 // Simple builtin fns
 size_t strlen(const char *s)
@@ -104,14 +104,14 @@ const struct
  */
 enum
 {
-    IDLE,           /**< No transfer in progress. */
-    STALLED,        /**< Endpoint stalled. */
-    DATA_IN,        /**< Sending data to host (more than one packet). */
-    LAST_DATA_IN,   /**< Sending final data packet to host. */
-    STATUS_IN,      /**< Status stage: device sends an IN ZLP. */
-    DATA_OUT,       /**< Receiving data from host (more than one packet). */
-    LAST_DATA_OUT,  /**< Receiving the final data packet from host. */
-    STATUS_OUT,     /**< Status stage: device receives an OUT ZLP. */
+    IDLE,          /**< No transfer in progress. */
+    STALLED,       /**< Endpoint stalled. */
+    DATA_IN,       /**< Sending data to host (more than one packet). */
+    LAST_DATA_IN,  /**< Sending final data packet to host. */
+    STATUS_IN,     /**< Status stage: device sends an IN ZLP. */
+    DATA_OUT,      /**< Receiving data from host (more than one packet). */
+    LAST_DATA_OUT, /**< Receiving the final data packet from host. */
+    STATUS_OUT,    /**< Status stage: device receives an OUT ZLP. */
 } usb_fsm_state = IDLE;
 
 /** @brief Remaining data length for the current control transfer (data stage). */

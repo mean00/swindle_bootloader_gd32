@@ -81,7 +81,8 @@ static void chain_to(uint32_t addr)
                      "msr msp, r0\n"
                      "msr psp, r0\n"
                      "add r12,#4\n"
-                     "ldr pc, [r12]\n" ::"r"(addr));
+                     "ldr pc, [r12]\n" ::"r"(addr)
+                     : "r0", "r12");
 }
 
 /**
