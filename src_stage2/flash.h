@@ -12,7 +12,15 @@
 #define FLASH_SR_BSY (1 << 0)
 
 /** Flash page erase size in bytes. Must match the MCU's minimum erase granule. */
-#define FLASH_PAGE_SIZE 1024
+static inline uint32_t get_flash_page_size()
+{
+    static uint32_t cached_size = 0;
+    if (!cached_size)
+    {
+        cached_size = (lnCpuID::vendor() == lnCpuID::LN_VENDOR_GD) ? 2048 : 1024;
+    }
+    return cached_size;
+}
 struct LN_FMCx
 {
     uint32_t WS;     // 00 ACR
@@ -74,7 +82,7 @@ static void _flash_erase_page(uint32_t page_address)
 static int _flash_page_is_erased(uint32_t addr)
 {
     volatile uint32_t *_ptr32 = (uint32_t *)addr;
-    for (unsigned i = 0; i < FLASH_PAGE_SIZE / sizeof(uint32_t); i++)
+    for (unsigned i = 0; i < get_flash_page_size() / sizeof(uint32_t); i++)
         if (_ptr32[i] != 0xffffffffU)
             return 0;
     return 1;
@@ -173,7 +181,7 @@ static void check_do_erase()
     /* Change usb_strings accordingly */
     const uint32_t start_addr = FLASH_BASE_ADDR + (FLASH_BOOTLDR_SIZE_KB * 1024);
     const uint32_t end_addr = FLASH_BASE_ADDR + (lnCpuID::flashSize() * 1024);
-    for (uint32_t addr = start_addr; addr < end_addr; addr += FLASH_PAGE_SIZE)
+    for (uint32_t addr = start_addr; addr < end_addr; addr += get_flash_page_size())
         if (!_flash_page_is_erased(addr))
             _flash_erase_page(addr);
 

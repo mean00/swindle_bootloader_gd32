@@ -117,22 +117,35 @@ static void prepare_memory_layout()
 {
     int flash_size = lnCpuID::flashSize();
     int user_kb = flash_size - FLASH_BOOTLDR_SIZE_KB;
+    uint32_t page_size = get_flash_page_size();
+    int page_size_kb = page_size / 1024;
+    int bootloader_pages = FLASH_BOOTLDR_SIZE_KB / page_size_kb;
+    int user_pages = user_kb / page_size_kb;
 
     xstrcpy(memory_layout, "@Internal Flash /0x08000000/");
-    xstrcat(memory_layout, BOOTLOADER_SIZE_STR);
-    xstrcat(memory_layout, "*001Ka,");
 
-    /* Convert user_kb to decimal string. */
     char num[8];
-    char *p = num + sizeof(num) - 1;
+    char *p;
+
+    p = num + sizeof(num) - 1;
     *p = 0;
     do
     {
-        *--p = '0' + (user_kb % 10);
-        user_kb /= 10;
-    } while (user_kb);
+        *--p = '0' + (bootloader_pages % 10);
+        bootloader_pages /= 10;
+    } while (bootloader_pages);
     xstrcat(memory_layout, p);
-    xstrcat(memory_layout, "*001Kg");
+    xstrcat(memory_layout, (page_size_kb == 2) ? "*002Ka," : "*001Ka,");
+
+    p = num + sizeof(num) - 1;
+    *p = 0;
+    do
+    {
+        *--p = '0' + (user_pages % 10);
+        user_pages /= 10;
+    } while (user_pages);
+    xstrcat(memory_layout, p);
+    xstrcat(memory_layout, (page_size_kb == 2) ? "*002Kg" : "*001Kg");
 }
 
 /**
@@ -266,7 +279,7 @@ static void usbdfu_getstatus_complete(struct usb_setup_data *req)
             {
                 // Erase each hardware page in the transfer range, then
                 // program the full chunk in one go.
-                for (uint32_t page = baseaddr; page < baseaddr + prog.len; page += FLASH_PAGE_SIZE)
+                for (uint32_t page = baseaddr; page < baseaddr + prog.len; page += get_flash_page_size())
                     if (!_flash_page_is_erased(page))
                         _flash_erase_page(page);
                 if (gd32)
